@@ -30,7 +30,7 @@ go run main.go --op split --filePath ~/Downloads/testfile.txt
 ```
 Specified chunk size - 100KB
 
-go run main.go --op split --filePath ~/Downloads/testfile.txt --size 1 --format KB
+go run main.go --op split --filePath ~/Downloads/testfile.txt --size 100 --format KB
 ```
 
 ```
