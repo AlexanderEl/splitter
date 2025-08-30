@@ -1,6 +1,7 @@
 package splitter
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/AlexanderEl/encryptor"
 )
 
 type Splitter interface {
@@ -20,14 +23,9 @@ type Splitter interface {
 }
 
 type Split struct {
-	EncryptionConfig EncryptionConfig
-	FileName         string // Name of the file at FilePath location
-	FilePath         string // Path to the location of the file
-}
-
-type EncryptionConfig struct {
 	IsEncrypted bool
-	Password    string
+	FileName    string // Name of the file at FilePath location
+	FilePath    string // Path to the location of the file
 }
 
 type SplitConfigs struct {
@@ -35,11 +33,17 @@ type SplitConfigs struct {
 	Format    string // B, KB, MB, GB
 }
 
+type encryptionConfig struct {
+	isEncrypted       bool
+	encryptionService encryptor.Service
+}
+
 type splitterDetails struct {
 	numChunks     int64
 	totalFileSize int64
 	fileSize      int
 	dirPath       string
+	encryption    encryptionConfig
 }
 
 var outputDirPrefix string = "file-data_"
@@ -60,7 +64,7 @@ func (s *Split) Split(configs SplitConfigs) error {
 
 	wg.Add(workerCount)
 	go splitFile(details, filePath, &wg, errorCh)
-	go createChecksumFile(filePath, checksumFilePath, &wg, errorCh)
+	go createChecksumFile(details, filePath, checksumFilePath, &wg, errorCh)
 	go func() {
 		wg.Wait()
 		close(errorCh)
@@ -99,11 +103,17 @@ func prepareForSplitting(s *Split, configs SplitConfigs) (*splitterDetails, erro
 		return nil, err
 	}
 
+	encryption := encryptionConfig{isEncrypted: s.IsEncrypted}
+	if s.IsEncrypted {
+		encryption.encryptionService = encryptor.Service{}
+	}
+
 	return &splitterDetails{
 		numChunks:     fileInfo.Size()/int64(fileSize) + 1,
 		totalFileSize: fileInfo.Size(),
 		fileSize:      fileSize,
 		dirPath:       dirPath,
+		encryption:    encryption,
 	}, nil
 }
 
@@ -185,7 +195,16 @@ func splitFile(details *splitterDetails, filePath string, wg *sync.WaitGroup, ch
 		}
 		defer dstFile.Close()
 
-		_, err = dstFile.Write(fileBuffer[:numReadBytes])
+		bytesToWrite := fileBuffer[:numReadBytes]
+		if details.encryption.isEncrypted {
+			bytesToWrite, err = details.encryption.encryptionService.Encrypt(bytesToWrite)
+			if err != nil {
+				ch <- fmt.Errorf("failure to encrypt bytes with error: %s", err)
+				return
+			}
+		}
+
+		_, err = dstFile.Write(bytesToWrite)
 		if err != nil {
 			ch <- fmt.Errorf("failure to write destination file with error: %s", err)
 			return
@@ -193,7 +212,7 @@ func splitFile(details *splitterDetails, filePath string, wg *sync.WaitGroup, ch
 	}
 }
 
-func createChecksumFile(filePath, outputPath string, wg *sync.WaitGroup, ch chan error) {
+func createChecksumFile(details *splitterDetails, filePath, outputPath string, wg *sync.WaitGroup, ch chan error) {
 	defer wg.Done()
 
 	file, err := os.Open(filePath)
@@ -209,19 +228,40 @@ func createChecksumFile(filePath, outputPath string, wg *sync.WaitGroup, ch chan
 		return
 	}
 
-	checkSumStr := fmt.Sprintf("%x", hash.Sum(nil))
-	if err = os.WriteFile(outputPath, []byte(checkSumStr), 0644); err != nil {
+	checkSumBytes := hash.Sum(nil)
+
+	if details.encryption.isEncrypted {
+		checkSumBytes, err = details.encryption.encryptionService.Encrypt(checkSumBytes)
+		if err != nil {
+			ch <- fmt.Errorf("failure to encrypt checksum bytes with error: '%s'", err)
+		}
+	}
+
+	if err = os.WriteFile(outputPath, checkSumBytes, 0644); err != nil {
 		ch <- fmt.Errorf("failure to write checksum file: %s", err)
 	}
 }
 
-func (s *Split) Merge() error {
+func (s *Split) Merge(encryptionFilePath string) error {
+	var encryptionService *encryptor.Service
+	var err error
+	// Initialize encryption service for merging
+	if s.IsEncrypted {
+		encryptionService, err = encryptor.GetEncryptionServiceFromFile(encryptionFilePath)
+		if err != nil {
+			return fmt.Errorf("failure to generate encryption service with error: '%s'", err)
+		}
+	}
+
 	if _, err := os.Stat(s.FilePath); os.IsNotExist(err) {
 		return fmt.Errorf("provided directory path does not exist with error: %s", err)
 	}
 
 	fileName := s.FileName
 	if len(fileName) == 0 {
+		// Remove trailing slash
+		s.FilePath = strings.TrimSuffix(s.FilePath, "/")
+
 		paths := strings.Split(s.FilePath, "/")
 		if len(paths) > 1 {
 			fileName = paths[len(paths)-1]
@@ -247,21 +287,26 @@ func (s *Split) Merge() error {
 			continue // Skip checksum file until all pieces are merged together
 		}
 
-		file, err := os.Open(cleanFilePath(s.FilePath, e.Name()))
+		bytesToWrite, err := os.ReadFile(cleanFilePath(s.FilePath, e.Name()))
 		if err != nil {
-			return fmt.Errorf("failed to open file with error: %s", err)
+			return fmt.Errorf("failed to read file with error: %s", err)
 		}
 
-		bytesCopied, err := io.Copy(outputFile, file)
-		if err != nil {
-			return fmt.Errorf("failed to write from '%s' to '%s' with error: %s",
-				e.Name(), outputFile.Name(), err)
+		if s.IsEncrypted {
+			bytesToWrite, err = encryptionService.Decrypt(bytesToWrite)
+			if err != nil {
+				return fmt.Errorf("failure to decrypt file content with error: '%s'", err)
+			}
 		}
-		fmt.Printf("bytesCopied: %v\n", bytesCopied)
+
+		_, err = outputFile.Write(bytesToWrite)
+		if err != nil {
+			return fmt.Errorf("failed to write bytes to '%s' with error: '%s'", outputFile.Name(), err)
+		}
 	}
 
 	// Compare checksums
-	doesChecksumMatch, err := compareChecksums(fileName, cleanFilePath(s.FilePath, checksumFileName))
+	doesChecksumMatch, err := compareChecksums(fileName, cleanFilePath(s.FilePath, checksumFileName), encryptionService)
 	if err != nil {
 		return fmt.Errorf("error comparing checksums: %s", err)
 	}
@@ -269,12 +314,10 @@ func (s *Split) Merge() error {
 		return fmt.Errorf("checksums do not match")
 	}
 
-	fmt.Printf("doesChecksumMatch: %v\n", doesChecksumMatch)
-
 	return nil
 }
 
-func compareChecksums(outputFilePath, checksumFilePath string) (bool, error) {
+func compareChecksums(outputFilePath, checksumFilePath string, encryptionService *encryptor.Service) (bool, error) {
 	file, err := os.Open(outputFilePath)
 	if err != nil {
 		return false, fmt.Errorf("failure to open file for checksum comparison with error: %s", err)
@@ -286,12 +329,19 @@ func compareChecksums(outputFilePath, checksumFilePath string) (bool, error) {
 		return false, fmt.Errorf("failure to copy file contents for hashing: %s", err)
 	}
 
-	newFileHash := fmt.Sprintf("%x", hash.Sum(nil))
+	newCheckSumBytes := hash.Sum(nil)
 
 	fileBytes, err := os.ReadFile(checksumFilePath)
 	if err != nil {
 		return false, fmt.Errorf("error reading checksum file: %s", err)
 	}
 
-	return newFileHash == string(fileBytes), nil
+	if encryptionService != nil {
+		fileBytes, err = encryptionService.Decrypt(fileBytes)
+		if err != nil {
+			return false, fmt.Errorf("failure to decrypt checksum bytes with error :\n\t'%s'", err)
+		}
+	}
+
+	return bytes.Equal(newCheckSumBytes, fileBytes), nil
 }
