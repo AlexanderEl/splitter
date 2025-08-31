@@ -284,8 +284,9 @@ func (s *Split) Merge(encryptionFilePath string) error {
 	}
 	defer outputFile.Close()
 
+	totalEntries := int64(len(entries))
 	for i, e := range entries {
-		displayProgressBar(int64(i), int64(len(entries)))
+		displayProgressBar(int64(i), totalEntries)
 
 		if e.Name() == checksumFileName {
 			continue // Skip checksum file until all pieces are merged together
@@ -322,6 +323,7 @@ func (s *Split) Merge(encryptionFilePath string) error {
 }
 
 func compareChecksums(outputFilePath, checksumFilePath string, encryptionService *encryptor.Service) (bool, error) {
+	fmt.Printf("Validating checksums\r")
 	file, err := os.Open(outputFilePath)
 	if err != nil {
 		return false, fmt.Errorf("failure to open file for checksum comparison with error: %s", err)
