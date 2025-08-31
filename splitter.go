@@ -178,6 +178,8 @@ func splitFile(details *splitterDetails, filePath string, wg *sync.WaitGroup, ch
 	outputFileNamePrefix := details.dirPath + "/" + "data_"
 
 	for chunkCount := range details.numChunks {
+		displayProgressBar(chunkCount, details.numChunks)
+
 		numReadBytes, err := file.Read(fileBuffer)
 		if err != nil && err != io.EOF {
 			ch <- fmt.Errorf("error while reading file - error: %s", err)
@@ -282,7 +284,9 @@ func (s *Split) Merge(encryptionFilePath string) error {
 	}
 	defer outputFile.Close()
 
-	for _, e := range entries {
+	for i, e := range entries {
+		displayProgressBar(int64(i), int64(len(entries)))
+
 		if e.Name() == checksumFileName {
 			continue // Skip checksum file until all pieces are merged together
 		}
@@ -344,4 +348,27 @@ func compareChecksums(outputFilePath, checksumFilePath string, encryptionService
 	}
 
 	return bytes.Equal(newCheckSumBytes, fileBytes), nil
+}
+
+func displayProgressBar(current, total int64) {
+	percentage, charList := int(100*(current+1)/total), make([]byte, 100)
+
+	// Create and display the progress bar
+	for i := range charList {
+		var char byte = 46 // char: .
+		if percentage >= i {
+			char = 124 // char: |
+		}
+		charList[i] = char
+	}
+	fmt.Printf("[ %s ] %d%% \r", charList, percentage)
+
+	// Cleanup the display bar on completion
+	if percentage == 100 {
+		emptyList := make([]byte, 110)
+		for i := range emptyList {
+			emptyList[i] = 32 // char: space
+		}
+		fmt.Printf("%s\r", emptyList)
+	}
 }
